@@ -612,15 +612,18 @@ func (w *wizard) askKind(ctx context.Context, def *agent.Definition) error {
 
 // askModel asks for the model in the vocabulary of the definition's kind:
 // claude has aliases every install can name, codex wants its own model
-// id, opencode a provider/model pair.
+// id (real ones, read off this host's Codex CLI where there is one:
+// models.go), opencode a provider/model pair. Every kind's answer is free
+// text over its options — the options are the models worth naming, not the
+// models allowed.
 func (w *wizard) askModel(ctx context.Context, def *agent.Definition) error {
 	q := agent.Question{Header: "Model", Text: "Which model? Pick one or type a full model id.",
 		Options: options("sonnet", "balanced", "opus", "frontier default", "fable", "most capable", "haiku", "fastest")}
 	switch def.Kind {
 	case agent.KindCodex:
-		q = agent.Question{Header: "Model", Text: "Which model? Type a Codex model id, e.g. `gpt-5-codex`."}
+		q = agent.Question{Header: "Model", Text: "Which model? Pick one or type a Codex model id.", Options: codexModels()}
 	case agent.KindOpenCode:
-		q = agent.Question{Header: "Model", Text: "Which model? Type it as `provider/model`, e.g. `zai-coding-plan/glm-4.6` or `deepseek/deepseek-chat`."}
+		q = agent.Question{Header: "Model", Text: "Which model? Pick one or type it as `provider/model`.", Options: opencodeModels}
 	}
 	var err error
 	def.Model, err = w.askUntil(ctx, q, nonEmpty("model"))

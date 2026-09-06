@@ -75,3 +75,66 @@ func TestAddAgentAsksKindWhenThereIsAChoice(t *testing.T) {
 		t.Fatalf("stored definition = %+v", def)
 	}
 }
+
+// TestAddCodexAgentOffersRealModels: the Model question for a codex
+// definition is a pick list of ids that exist on this host, not a blank
+// "type a model id" — and typing one anyway still wins.
+func TestAddCodexAgentOffersRealModels(t *testing.T) {
+	home := t.TempDir()
+	write(t, filepath.Join(home, "models_cache.json"), `{"models":[
+		{"slug":"gpt-9-new","display_name":"GPT-9-New","description":"the newest","visibility":"list"},
+		{"slug":"gpt-8-old","display_name":"GPT-8-Old","description":"the older one","visibility":"list"}
+	]}`)
+	t.Setenv("CODEX_HOME", home)
+
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ex := execlocal.New(map[agent.Kind]agent.Agent{agent.KindCodex: fakeAgent{}}, map[environment.Kind]environment.Factory{environment.KindLocal: envlocal.Factory{}}, 200*time.Millisecond)
+	tr := &fakeTransport{name: "slack", ready: make(chan struct{})}
+	c := New(st, ex, []transport.Transport{tr}, []surface.Surface{chat.New("chat", "slack", false)}, nil)
+	c.AgentKinds = []agent.Kind{agent.KindClaude, agent.KindCodex}
+	go c.Run(ctx)
+	<-tr.ready
+
+	th := transport.ThreadID("C-dev/31.0")
+	tr.say(th, "agent add")
+	tr.waitFor(t, th, "Name for the new agent")
+	tr.say(th, "coder")
+	tr.waitFor(t, th, "Which agent runs it?")
+	tr.say(th, "codex")
+	model := tr.waitFor(t, th, "Which model")
+	if model.Prompt == nil || len(model.Prompt.Options) != 2 {
+		t.Fatalf("model prompt = %+v", model.Prompt)
+	}
+	if model.Prompt.Options[0].Label != "gpt-9-new" || model.Prompt.Options[0].Description != "the newest" {
+		t.Fatalf("first option = %+v", model.Prompt.Options[0])
+	}
+	tr.say(th, "gpt-8-old")
+	tr.waitFor(t, th, "Where does it run")
+	tr.say(th, "local")
+	tr.waitFor(t, th, "Absolute path")
+	tr.say(th, "none")
+	tr.waitFor(t, th, "Permission mode?")
+	tr.say(th, "manual")
+	tr.waitFor(t, th, "Pre-approved tools")
+	tr.say(th, "Read-only")
+	tr.waitFor(t, th, "Extra instructions")
+	tr.say(th, "skip")
+	tr.waitFor(t, th, "Save this agent?")
+	tr.say(th, "save")
+	tr.waitFor(t, th, "agent *coder* saved")
+
+	def, err := st.GetDefinition(ctx, "coder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.Kind != agent.KindCodex || def.Model != "gpt-8-old" {
+		t.Fatalf("stored definition = %+v", def)
+	}
+}
