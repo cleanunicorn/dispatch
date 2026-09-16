@@ -116,9 +116,10 @@ an error, a "dispatch is back" notice that asks you to pick the task up —
 mention whoever wrote the message the turn answers (`@you ✅ done · …`), so
 you can mute the thread and still be told when to look. Only that one person
 is tagged: on a thread two people share, each is tagged on the answers to
-their own messages — a message sent while a turn is still going is tagged
-when its own answer lands, and whoever clicks a prompt's button does not
-take the tag from the person who asked; `⏹️ cancelled` is not tagged; the
+their own messages — a message sent while a turn is still going joins that
+turn, so its writer is the one tagged when it ends, and whoever clicks a
+prompt's button does not take the tag from the person who asked; `⏹️
+cancelled` is not tagged; the
 status line and the agent's own text never are. This needs no extra scope.
 
 The same text also shows above the composer ("dispatch ⏳ thinking · 4s") when

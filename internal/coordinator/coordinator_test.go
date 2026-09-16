@@ -616,25 +616,24 @@ func TestMentionFollowsAskerWarm(t *testing.T) {
 	}
 }
 
-// TestMentionQueuesAMidTurnAsker: a message written while a turn is still
-// going is answered after it, so the turn in progress keeps addressing its
-// own asker and the one after it addresses the writer.
-func TestMentionQueuesAMidTurnAsker(t *testing.T) {
+// TestMentionMidTurnGoesToTheLatestWriter: a message written while a turn
+// is still going joins that turn (a driver steers it in), so the turn's
+// closing line addresses its writer — and a prompt answered by someone
+// else does not take the tag back.
+func TestMentionMidTurnGoesToTheLatestWriter(t *testing.T) {
 	_, _, _, tr := mentionHarness(t, time.Minute)
 
 	th := transport.ThreadID("C-dev/3.0")
 	tr.sayAs(th, "u1", "run coder do the thing")
 	p := tr.waitFor(t, th, "wants to run") // u1's turn is open, waiting on the prompt
-	// The fake answers a send with a turn of its own at once, which ends
-	// first here; what matters is the order the two closing lines take.
 	tr.sayAs(th, "u2", "and also this")
 	tr.waitFor(t, th, "echo:and also this")
-	if o := tr.waitFor(t, th, "✅ done"); o.Mention != "u1" {
-		t.Errorf("the turn in progress closed addressing %q, want u1", o.Mention)
+	if o := tr.waitFor(t, th, "✅ done"); o.Mention != "u2" {
+		t.Errorf("closing line after u2 wrote mid-turn addressed %q, want u2", o.Mention)
 	}
 	tr.decideAs(th, "u1", p.Prompt.ID, "allow")
 	if o := tr.waitForN(t, th, "✅ done", 2); o.Mention != "u2" {
-		t.Errorf("the turn after it closed addressing %q, want u2", o.Mention)
+		t.Errorf("closing line after u1 answered the prompt addressed %q, want u2", o.Mention)
 	}
 }
 

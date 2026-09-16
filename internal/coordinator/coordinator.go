@@ -1358,10 +1358,6 @@ type taskSink struct {
 	// drained still reports a result as it exits) and do not count, which
 	// is what keeps a cut-short turn from looking finished.
 	answered bool
-	// askers wrote messages to the agent while a turn was still going, in
-	// order: each asks for a turn still to come (setAsker). In memory
-	// only, like the messages themselves, which live in the agent process.
-	askers []string
 }
 
 func (s *taskSink) snapshot() store.TaskState {
@@ -1415,34 +1411,21 @@ func (s *taskSink) turnFinished() bool {
 // an undo for a send that failed. An empty user — a message nobody typed —
 // changes nothing.
 //
-// Between turns the writer is the asker at once. While a turn is still
-// going they are queued instead: the agent answers the message after the
-// turn in progress, whose closing line still belongs to whoever asked for
-// it, and OnEvent promotes them when that turn ends.
+// The writer becomes the asker at once, even while a turn is still going.
+// Which turn answers a mid-turn message is the driver's business, not
+// something the events say: Codex steers it into the turn in progress
+// (turn/steer), whose closing line then answers them too. A queue of
+// askers waiting for "their" turn would wait for one that never comes.
 func (s *taskSink) setAsker(ctx context.Context, user string) (seq int64, undo func()) {
 	s.putMu.Lock()
 	defer s.putMu.Unlock()
 	s.mu.Lock()
 	seq, undo = s.state.LastSeq, func() {}
-	if user == "" {
+	prev := s.state.Asker
+	if user == "" || prev == user {
 		s.mu.Unlock()
 		return seq, undo
 	}
-	if s.state.Status == store.StatusRunning || s.state.Status == store.StatusWaitingPermission {
-		s.askers = append(s.askers, user)
-		s.mu.Unlock()
-		return seq, func() {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			for i := len(s.askers) - 1; i >= 0; i-- {
-				if s.askers[i] == user {
-					s.askers = append(s.askers[:i], s.askers[i+1:]...)
-					return
-				}
-			}
-		}
-	}
-	prev := s.state.Asker
 	s.state.Asker = user
 	st := s.state
 	s.mu.Unlock()
@@ -1512,11 +1495,6 @@ func (s *taskSink) OnEvent(ctx context.Context, id executor.TaskID, ev agent.Eve
 		s.answered = false
 	}
 	st := s.state
-	if (ev.Type == agent.EventResult || ev.Type == agent.EventError) && len(s.askers) > 0 {
-		// This turn's closing line (st) still addresses its own asker; the
-		// next turn answers the first message queued behind it.
-		s.state.Asker, s.askers = s.askers[0], s.askers[1:]
-	}
 	s.mu.Unlock()
 	s.persist(ctx, st)
 	s.putMu.Unlock()
