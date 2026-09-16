@@ -319,8 +319,10 @@ The layers:
   message it posted under the key and mirrors the text into the thread's
   assistant status; the terminal redraws the line. `Outbound.Mention`
   addresses one user (Slack: `<@U…>` in front of the text; terminal ignores
-  it); the chat surface sets it to the task's `Requester` on the lines that
-  need a human — prompts, the closing line, errors, the restart notices that
+  it); the chat surface sets it to the task's `Addressee()` — the `Asker`,
+  whoever wrote the message the turn answers, so on a shared thread the
+  one waiting is tagged, not the `Requester` who started it — on the lines
+  that need a human — prompts, the closing line, errors, the restart notices that
   ask someone to pick a task up — never on the agent's Markdown text, which
   the markdown block does not render mentions in.
 - **`surface`** (chat, feed) — everything about *how* humans interact.

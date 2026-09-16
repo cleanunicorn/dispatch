@@ -942,7 +942,7 @@ func (c *Coordinator) runTaskModel(ctx context.Context, s surface.Surface, it su
 		def.Environment.Kind = environment.KindLocal
 	}
 	def.Environment = c.resolveEnv(def.Environment, def.Name, string(it.Thread), string(id))
-	st := store.TaskState{ID: id, Transport: c.taskTransport(ctx, s, it.Thread), Thread: it.Thread, Definition: def, Requester: it.User, Status: store.StatusQueued}
+	st := store.TaskState{ID: id, Transport: c.taskTransport(ctx, s, it.Thread), Thread: it.Thread, Definition: def, Requester: it.User, Asker: it.User, Status: store.StatusQueued}
 	if err := c.Store.PutTask(ctx, st); err != nil {
 		c.emit(ctx, surface.Event{Kind: surface.EventError, Thread: it.Thread, Text: "store: " + err.Error()}, s)
 		return
@@ -1041,7 +1041,9 @@ func (c *Coordinator) followUp(ctx context.Context, s surface.Surface, it surfac
 	if ok {
 		seq := int64(-1)
 		if sink := c.sink(id); sink != nil {
-			seq = sink.snapshot().LastSeq
+			// Before the send: the turn it starts can end at once, and its
+			// closing line must address whoever wrote this.
+			seq = sink.setAsker(ctx, it.User)
 		}
 		if err := c.Executor.Send(ctx, id, it.Text, attachments(it.Files)); err == nil {
 			c.wake(ctx, id, seq)
@@ -1070,6 +1072,9 @@ func (c *Coordinator) followUp(ctx context.Context, s surface.Surface, it surfac
 	}
 	if st.Transport == "" {
 		st.Transport = c.taskTransport(ctx, s, it.Thread)
+	}
+	if it.User != "" {
+		st.Asker = it.User
 	}
 	c.bind(it.Thread, st.ID, s.Name())
 	c.broadcast(ctx, surface.Event{Kind: surface.EventResumed, Thread: it.Thread, TaskID: st.ID, Task: &st})
@@ -1397,6 +1402,26 @@ func (s *taskSink) turnFinished() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.answered
+}
+
+// setAsker records who wrote the message about to be sent to the running
+// agent, so the turn it starts addresses them, and returns the log
+// position the state was at beforehand (what wake compares against). An
+// empty user — a message nobody typed — leaves the asker as it was.
+func (s *taskSink) setAsker(ctx context.Context, user string) (seq int64) {
+	s.putMu.Lock()
+	defer s.putMu.Unlock()
+	s.mu.Lock()
+	seq = s.state.LastSeq
+	if user == "" || s.state.Asker == user {
+		s.mu.Unlock()
+		return seq
+	}
+	s.state.Asker = user
+	st := s.state
+	s.mu.Unlock()
+	s.persist(ctx, st)
+	return seq
 }
 
 // setPin changes the task's ModelPin from outside the agent's event loop (a

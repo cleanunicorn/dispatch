@@ -184,6 +184,26 @@ func TestRenderMentionsRequester(t *testing.T) {
 	}
 }
 
+// TestRenderMentionsAsker: a turn someone other than the requester asked
+// for addresses them; a task without an asker falls back to the requester.
+func TestRenderMentionsAsker(t *testing.T) {
+	th := transport.ThreadID("C1/1.0")
+	for _, c := range []struct {
+		requester, asker, want string
+	}{
+		{"U42", "U7", "U7"},
+		{"U42", "", "U42"},
+		{"", "", ""},
+	} {
+		task := &store.TaskState{ID: "t1", Thread: th, Requester: c.requester, Asker: c.asker, Definition: agent.Definition{Name: "coder"}}
+		s := New("chat", "slack", true)
+		out := lines(s.Render(surface.Event{Kind: surface.EventAgent, Thread: th, TaskID: task.ID, Task: task, Agent: &agent.Event{Type: agent.EventResult}}))
+		if len(out) != 1 || out[0].Mention != c.want {
+			t.Errorf("requester %q asker %q: got %+v, want mention %q", c.requester, c.asker, out, c.want)
+		}
+	}
+}
+
 func TestPermissionPromptIsCutWithItsFenceClosed(t *testing.T) {
 	s := New("chat", "slack", false)
 	task := &store.TaskState{ID: "t1", Requester: "U42", Definition: agent.Definition{Name: "coder"}}
