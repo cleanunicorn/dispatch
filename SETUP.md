@@ -113,9 +113,12 @@ are in progress, 📬 and ❌ are yours to answer or close, ✅ is done with.
 
 The lines that need you — a permission or question prompt, the closing line,
 an error, a "dispatch is back" notice that asks you to pick the task up —
-mention whoever started the task (`@you ✅ done · …`), so you can mute the
-thread and still be told when to look. Only that one person is tagged, even
-if someone else replies in the thread; `⏹️ cancelled` is not tagged; the
+mention whoever wrote the message the turn answers (`@you ✅ done · …`), so
+you can mute the thread and still be told when to look. Only that one person
+is tagged: on a thread two people share, each is tagged on the answers to
+their own messages — a message sent while a turn is still going is tagged
+when its own answer lands, and whoever clicks a prompt's button does not
+take the tag from the person who asked; `⏹️ cancelled` is not tagged; the
 status line and the agent's own text never are. This needs no extra scope.
 
 The same text also shows above the composer ("dispatch ⏳ thinking · 4s") when

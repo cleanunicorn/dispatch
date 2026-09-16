@@ -1040,15 +1040,16 @@ func (c *Coordinator) followUp(ctx context.Context, s surface.Surface, it surfac
 	id, ok := c.lookup(it.Thread)
 	if ok {
 		seq := int64(-1)
+		undo := func() {}
 		if sink := c.sink(id); sink != nil {
 			// Before the send: the turn it starts can end at once, and its
 			// closing line must address whoever wrote this.
-			seq = sink.setAsker(ctx, it.User)
+			seq, undo = sink.setAsker(ctx, it.User)
 		}
 		if err := c.Executor.Send(ctx, id, it.Text, attachments(it.Files)); err == nil {
 			c.wake(ctx, id, seq)
 			return id, true
-		} else if !errors.Is(err, execlocal.ErrNotRunning) {
+		} else if undo(); !errors.Is(err, execlocal.ErrNotRunning) {
 			c.emit(ctx, surface.Event{Kind: surface.EventError, Thread: it.Thread, TaskID: id, Text: "send: " + err.Error()}, s)
 			return
 		}
@@ -1357,6 +1358,10 @@ type taskSink struct {
 	// drained still reports a result as it exits) and do not count, which
 	// is what keeps a cut-short turn from looking finished.
 	answered bool
+	// askers wrote messages to the agent while a turn was still going, in
+	// order: each asks for a turn still to come (setAsker). In memory
+	// only, like the messages themselves, which live in the agent process.
+	askers []string
 }
 
 func (s *taskSink) snapshot() store.TaskState {
@@ -1405,23 +1410,56 @@ func (s *taskSink) turnFinished() bool {
 }
 
 // setAsker records who wrote the message about to be sent to the running
-// agent, so the turn it starts addresses them, and returns the log
-// position the state was at beforehand (what wake compares against). An
-// empty user — a message nobody typed — leaves the asker as it was.
-func (s *taskSink) setAsker(ctx context.Context, user string) (seq int64) {
+// agent, so the turn that answers it addresses them. It returns the log
+// position the state was at beforehand (what wake compares against) and
+// an undo for a send that failed. An empty user — a message nobody typed —
+// changes nothing.
+//
+// Between turns the writer is the asker at once. While a turn is still
+// going they are queued instead: the agent answers the message after the
+// turn in progress, whose closing line still belongs to whoever asked for
+// it, and OnEvent promotes them when that turn ends.
+func (s *taskSink) setAsker(ctx context.Context, user string) (seq int64, undo func()) {
 	s.putMu.Lock()
 	defer s.putMu.Unlock()
 	s.mu.Lock()
-	seq = s.state.LastSeq
-	if user == "" || s.state.Asker == user {
+	seq, undo = s.state.LastSeq, func() {}
+	if user == "" {
 		s.mu.Unlock()
-		return seq
+		return seq, undo
 	}
+	if s.state.Status == store.StatusRunning || s.state.Status == store.StatusWaitingPermission {
+		s.askers = append(s.askers, user)
+		s.mu.Unlock()
+		return seq, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			for i := len(s.askers) - 1; i >= 0; i-- {
+				if s.askers[i] == user {
+					s.askers = append(s.askers[:i], s.askers[i+1:]...)
+					return
+				}
+			}
+		}
+	}
+	prev := s.state.Asker
 	s.state.Asker = user
 	st := s.state
 	s.mu.Unlock()
 	s.persist(ctx, st)
-	return seq
+	return seq, func() {
+		s.putMu.Lock()
+		defer s.putMu.Unlock()
+		s.mu.Lock()
+		if s.state.Asker != user {
+			s.mu.Unlock()
+			return
+		}
+		s.state.Asker = prev
+		st := s.state
+		s.mu.Unlock()
+		s.persist(ctx, st)
+	}
 }
 
 // setPin changes the task's ModelPin from outside the agent's event loop (a
@@ -1474,6 +1512,11 @@ func (s *taskSink) OnEvent(ctx context.Context, id executor.TaskID, ev agent.Eve
 		s.answered = false
 	}
 	st := s.state
+	if (ev.Type == agent.EventResult || ev.Type == agent.EventError) && len(s.askers) > 0 {
+		// This turn's closing line (st) still addresses its own asker; the
+		// next turn answers the first message queued behind it.
+		s.state.Asker, s.askers = s.askers[0], s.askers[1:]
+	}
 	s.mu.Unlock()
 	s.persist(ctx, st)
 	s.putMu.Unlock()
@@ -1678,7 +1721,7 @@ func (c *Coordinator) broadcast(ctx context.Context, ev surface.Event) {
 	}
 }
 
-// notice tells t's thread that a restart left the task for its requester
+// notice tells t's thread that a restart left the task for its asker
 // to act on. Every notice carries its task, so surfaces can address them.
 func (c *Coordinator) notice(ctx context.Context, t store.TaskState, text string) {
 	c.emitTo(ctx, t.Transport, surface.Event{Kind: surface.EventNotice, Thread: t.Thread, TaskID: t.ID, Task: &t, Text: text})

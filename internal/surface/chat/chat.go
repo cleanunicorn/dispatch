@@ -248,7 +248,7 @@ func (s *Surface) Render(ev surface.Event) []transport.Outbound {
 	say := func(text string) []transport.Outbound {
 		return []transport.Outbound{{Thread: ev.Thread, Text: text}}
 	}
-	// tell is say for the lines the requester must not miss.
+	// tell is say for the lines the asker must not miss.
 	tell := func(text string) []transport.Outbound {
 		return []transport.Outbound{{Thread: ev.Thread, Text: text, Mention: requester(ev)}}
 	}
