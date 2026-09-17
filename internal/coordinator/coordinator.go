@@ -942,7 +942,7 @@ func (c *Coordinator) runTaskModel(ctx context.Context, s surface.Surface, it su
 		def.Environment.Kind = environment.KindLocal
 	}
 	def.Environment = c.resolveEnv(def.Environment, def.Name, string(it.Thread), string(id))
-	st := store.TaskState{ID: id, Transport: c.taskTransport(ctx, s, it.Thread), Thread: it.Thread, Definition: def, Requester: it.User, Status: store.StatusQueued}
+	st := store.TaskState{ID: id, Transport: c.taskTransport(ctx, s, it.Thread), Thread: it.Thread, Definition: def, Requester: it.User, Asker: it.User, Status: store.StatusQueued}
 	if err := c.Store.PutTask(ctx, st); err != nil {
 		c.emit(ctx, surface.Event{Kind: surface.EventError, Thread: it.Thread, Text: "store: " + err.Error()}, s)
 		return
@@ -1040,13 +1040,16 @@ func (c *Coordinator) followUp(ctx context.Context, s surface.Surface, it surfac
 	id, ok := c.lookup(it.Thread)
 	if ok {
 		seq := int64(-1)
+		undo := func() {}
 		if sink := c.sink(id); sink != nil {
-			seq = sink.snapshot().LastSeq
+			// Before the send: the turn it starts can end at once, and its
+			// closing line must address whoever wrote this.
+			seq, undo = sink.setAsker(ctx, it.User)
 		}
 		if err := c.Executor.Send(ctx, id, it.Text, attachments(it.Files)); err == nil {
 			c.wake(ctx, id, seq)
 			return id, true
-		} else if !errors.Is(err, execlocal.ErrNotRunning) {
+		} else if undo(); !errors.Is(err, execlocal.ErrNotRunning) {
 			c.emit(ctx, surface.Event{Kind: surface.EventError, Thread: it.Thread, TaskID: id, Text: "send: " + err.Error()}, s)
 			return
 		}
@@ -1070,6 +1073,9 @@ func (c *Coordinator) followUp(ctx context.Context, s surface.Surface, it surfac
 	}
 	if st.Transport == "" {
 		st.Transport = c.taskTransport(ctx, s, it.Thread)
+	}
+	if it.User != "" {
+		st.Asker = it.User
 	}
 	c.bind(it.Thread, st.ID, s.Name())
 	c.broadcast(ctx, surface.Event{Kind: surface.EventResumed, Thread: it.Thread, TaskID: st.ID, Task: &st})
@@ -1399,6 +1405,46 @@ func (s *taskSink) turnFinished() bool {
 	return s.answered
 }
 
+// setAsker records who wrote the message about to be sent to the running
+// agent, so the turn that answers it addresses them. It returns the log
+// position the state was at beforehand (what wake compares against) and
+// an undo for a send that failed. An empty user — a message nobody typed —
+// changes nothing.
+//
+// The writer becomes the asker at once, even while a turn is still going.
+// Which turn answers a mid-turn message is the driver's business, not
+// something the events say: Codex steers it into the turn in progress
+// (turn/steer), whose closing line then answers them too. A queue of
+// askers waiting for "their" turn would wait for one that never comes.
+func (s *taskSink) setAsker(ctx context.Context, user string) (seq int64, undo func()) {
+	s.putMu.Lock()
+	defer s.putMu.Unlock()
+	s.mu.Lock()
+	seq, undo = s.state.LastSeq, func() {}
+	prev := s.state.Asker
+	if user == "" || prev == user {
+		s.mu.Unlock()
+		return seq, undo
+	}
+	s.state.Asker = user
+	st := s.state
+	s.mu.Unlock()
+	s.persist(ctx, st)
+	return seq, func() {
+		s.putMu.Lock()
+		defer s.putMu.Unlock()
+		s.mu.Lock()
+		if s.state.Asker != user {
+			s.mu.Unlock()
+			return
+		}
+		s.state.Asker = prev
+		st := s.state
+		s.mu.Unlock()
+		s.persist(ctx, st)
+	}
+}
+
 // setPin changes the task's ModelPin from outside the agent's event loop (a
 // workflow step's model override) and returns what it was. It goes through
 // putMu like every other state change, so a later OnEvent cannot persist a
@@ -1653,7 +1699,7 @@ func (c *Coordinator) broadcast(ctx context.Context, ev surface.Event) {
 	}
 }
 
-// notice tells t's thread that a restart left the task for its requester
+// notice tells t's thread that a restart left the task for its asker
 // to act on. Every notice carries its task, so surfaces can address them.
 func (c *Coordinator) notice(ctx context.Context, t store.TaskState, text string) {
 	c.emitTo(ctx, t.Transport, surface.Event{Kind: surface.EventNotice, Thread: t.Thread, TaskID: t.ID, Task: &t, Text: text})

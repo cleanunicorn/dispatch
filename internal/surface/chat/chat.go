@@ -48,9 +48,11 @@
 //
 // The lines that need the human — a turn's closing line, an error, a
 // permission or question prompt, a notice that a restart left the task
-// for them to pick up — address the task's requester
-// (transport.Outbound.Mention), so whoever started the task is notified
-// even with the thread muted, and nobody else is. "⏹️ cancelled" is the
+// for them to pick up — address the human the turn answers
+// (store.TaskState.Addressee, as transport.Outbound.Mention): whoever
+// started the task on its first turn, whoever wrote the follow-up after
+// that. So the one person waiting is notified even with the thread muted,
+// and nobody else is. "⏹️ cancelled" is the
 // exception: the human who asked for it is already there. Lines without
 // a task (help, a wizard's questions) have nobody to address.
 package chat
@@ -246,7 +248,7 @@ func (s *Surface) Render(ev surface.Event) []transport.Outbound {
 	say := func(text string) []transport.Outbound {
 		return []transport.Outbound{{Thread: ev.Thread, Text: text}}
 	}
-	// tell is say for the lines the requester must not miss.
+	// tell is say for the lines the asker must not miss.
 	tell := func(text string) []transport.Outbound {
 		return []transport.Outbound{{Thread: ev.Thread, Text: text, Mention: requester(ev)}}
 	}
@@ -378,13 +380,13 @@ func (s *Surface) renderAgent(ev surface.Event, now time.Time) []transport.Outbo
 }
 
 // requester is who to address on the lines that need a human: the user
-// who started the event's task, "" when the event has no task (help, a
-// wizard question) or the task predates requesters.
+// whose message the event's task is answering, "" when the event has no
+// task (help, a wizard question) or the task predates requesters.
 func requester(ev surface.Event) string {
 	if ev.Task == nil {
 		return ""
 	}
-	return ev.Task.Requester
+	return ev.Task.Addressee()
 }
 
 func files(a *agent.Event) []transport.File {

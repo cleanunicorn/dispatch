@@ -34,13 +34,19 @@ type TaskState struct {
 	Thread     transport.ThreadID
 	Definition agent.Definition
 	// Requester is the transport user id of the human who started the
-	// task. Surfaces address them when the agent finishes or waits for
-	// an answer, so a muted thread still reaches the one person it is for.
-	// Set once when the task is created and never reassigned: a follow-up
-	// by someone else still addresses the original requester. Empty for
-	// tasks recorded before the column existed, which address nobody.
+	// task. Set once when the task is created and never reassigned — it names
+	// the thread's owner (the web UI's "by …") — so the lines of a turn
+	// someone else asked for address Asker instead. Empty for tasks
+	// recorded before the column existed.
 	Requester string
-	Session   string
+	// Asker is the transport user id of the human whose message the
+	// current turn answers: the requester on the first turn, and whoever
+	// wrote the follow-up after that, so when two people share a thread
+	// the closing line reaches the one who is waiting for it. Empty for
+	// tasks recorded before the column existed and for a turn nobody
+	// typed; surfaces fall back to Requester (TaskState.Addressee).
+	Asker   string
+	Session string
 	// Model is the model the session resolved to, as the agent reported
 	// it on its first turn (agent.EventInit). Definition.Model is what
 	// was asked for and may be empty; this is what answered.
@@ -64,6 +70,16 @@ type TaskState struct {
 	Resumes int
 	// UpdatedAt is when the projection was last written (set by the store).
 	UpdatedAt time.Time
+}
+
+// Addressee is who the lines of the current turn that need a human —
+// its closing line, a prompt, an error — should address: the Asker, or
+// the Requester for a task that has none.
+func (t TaskState) Addressee() string {
+	if t.Asker != "" {
+		return t.Asker
+	}
+	return t.Requester
 }
 
 // Store persists the log and projections.

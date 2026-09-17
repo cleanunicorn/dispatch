@@ -38,7 +38,9 @@ the thread waits for your next message, or for `close`, which turns it ✅. A
 task thread always carries one mark, so a channel shows which ones need you. The
 lines that need you — a
 permission or question prompt, the closing line, an error — mention whoever
-started the task, so you can mute the thread and still be told when to look.
+wrote the message that turn answers (on a shared thread, the person who asked
+last, not the one who started it), so you can mute the thread and still be
+told when to look.
 The closing line ends with the charge on an API key; on a Claude subscription
 a meter follows it a moment later instead, one bar per plan window — the
 5-hour and 7-day windows, and a model's own weekly window when it has one —

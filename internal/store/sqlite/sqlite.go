@@ -132,6 +132,7 @@ func migrate(db *sql.DB) error {
 		{"requester", `ALTER TABLE tasks ADD COLUMN requester TEXT NOT NULL DEFAULT ''`},
 		{"model", `ALTER TABLE tasks ADD COLUMN model TEXT NOT NULL DEFAULT ''`},
 		{"model_pin", `ALTER TABLE tasks ADD COLUMN model_pin TEXT NOT NULL DEFAULT ''`},
+		{"asker", `ALTER TABLE tasks ADD COLUMN asker TEXT NOT NULL DEFAULT ''`},
 	} {
 		if cols[add.col] {
 			continue
@@ -254,7 +255,7 @@ func (s *Store) TaskRecords(ctx context.Context, task executor.TaskID, kind stri
 // an `excluded.` line in its ON CONFLICT SET, a dest in scanTask, and an
 // ALTER entry in migrate — the CREATE TABLE above only runs for a fresh
 // database, which is why transport and requester live in migrate alone.
-const taskCols = "id, transport, thread, definition, requester, session, model, model_pin, status, last_seq, prompt, resumes, updated_at"
+const taskCols = "id, transport, thread, definition, requester, asker, session, model, model_pin, status, last_seq, prompt, resumes, updated_at"
 
 func (s *Store) PutTask(ctx context.Context, t store.TaskState) error {
 	def, err := json.Marshal(t.Definition)
@@ -263,11 +264,11 @@ func (s *Store) PutTask(ctx context.Context, t store.TaskState) error {
 	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO tasks(`+taskCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET transport=excluded.transport, thread=excluded.thread, definition=excluded.definition,
-			requester=excluded.requester, session=excluded.session, model=excluded.model, model_pin=excluded.model_pin, status=excluded.status,
+			requester=excluded.requester, asker=excluded.asker, session=excluded.session, model=excluded.model, model_pin=excluded.model_pin, status=excluded.status,
 			last_seq=excluded.last_seq, prompt=excluded.prompt, resumes=excluded.resumes, updated_at=excluded.updated_at`,
-		string(t.ID), t.Transport, string(t.Thread), def, t.Requester, t.Session, t.Model, t.ModelPin, t.Status, t.LastSeq, t.Prompt, t.Resumes,
+		string(t.ID), t.Transport, string(t.Thread), def, t.Requester, t.Asker, t.Session, t.Model, t.ModelPin, t.Status, t.LastSeq, t.Prompt, t.Resumes,
 		time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
@@ -322,7 +323,7 @@ func scanTask(sc scanner) (store.TaskState, error) {
 	var t store.TaskState
 	var id, thread, updated string
 	var def []byte
-	if err := sc.Scan(&id, &t.Transport, &thread, &def, &t.Requester, &t.Session, &t.Model, &t.ModelPin, &t.Status, &t.LastSeq, &t.Prompt, &t.Resumes, &updated); err != nil {
+	if err := sc.Scan(&id, &t.Transport, &thread, &def, &t.Requester, &t.Asker, &t.Session, &t.Model, &t.ModelPin, &t.Status, &t.LastSeq, &t.Prompt, &t.Resumes, &updated); err != nil {
 		return t, err
 	}
 	t.ID, t.Thread = executor.TaskID(id), transport.ThreadID(thread)

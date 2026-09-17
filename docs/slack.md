@@ -72,8 +72,9 @@ transport.
   (`reactions:write`). Every task thread is either being worked on, waiting on you, or
   closed — scan a channel for 📬, ❌ and ✋ to find the ones that need you.
 - **Mentions** — the lines that need a human (prompts, the closing line, errors,
-  "dispatch is back" notices) tag whoever started the task, so you can mute the thread
-  and still be told when to look. The agent's own text never tags anyone.
+  "dispatch is back" notices) tag whoever wrote the message the turn answers — on a
+  shared thread, each person on the answers to their own messages — so you can mute the
+  thread and still be told when to look. The agent's own text never tags anyone.
 - **Agent text is Markdown** — rendered through a Block Kit `markdown` block, so
   headings, `**bold**` and fenced code look right. dispatch's own lines are Slack mrkdwn.
 - **Composer status** — "dispatch ⏳ thinking · 4s" above the message box, when the app

@@ -502,26 +502,51 @@ func TestTwoSurfacesOneTransport(t *testing.T) {
 	tr.waitFor(t, th3, "answers=Banana|medium, actually")
 }
 
-// TestMentionStaysWithRequester: the lines that need a human address the
-// one who started the task, even when someone else answers its prompt or
-// follows it up after idle.
-func TestMentionStaysWithRequester(t *testing.T) {
+// mentionHarness is a coordinator over a fake agent whose finished turns
+// stay warm for idle.
+func mentionHarness(t *testing.T, idle time.Duration) (context.Context, *Coordinator, store.Store, *fakeTransport) {
+	t.Helper()
 	st, err := sqlite.Open(filepath.Join(t.TempDir(), "c.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { st.Close() })
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 	if err := st.PutDefinition(ctx, agent.Definition{Name: "coder", Kind: "fake"}); err != nil {
 		t.Fatal(err)
 	}
-	ex := execlocal.New(map[agent.Kind]agent.Agent{"fake": fakeAgent{}}, map[environment.Kind]environment.Factory{environment.KindLocal: envlocal.Factory{}}, 200*time.Millisecond)
+	ex := execlocal.New(map[agent.Kind]agent.Agent{"fake": fakeAgent{}}, map[environment.Kind]environment.Factory{environment.KindLocal: envlocal.Factory{}}, idle)
 	tr := &fakeTransport{name: "slack", ready: make(chan struct{})}
 	c := New(st, ex, []transport.Transport{tr}, []surface.Surface{chat.New("chat", "slack", false)}, nil)
 	c.WorkdirRoot = t.TempDir()
 	go c.Run(ctx)
 	<-tr.ready
+	return ctx, c, st, tr
+}
+
+// waitUnbound waits for th's task to let go of the thread — its process
+// ended after the idle timeout — so the next message takes the cold path.
+func waitUnbound(t *testing.T, c *Coordinator, th transport.ThreadID) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, busy := c.lookup(th); !busy {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("thread still bound to its task after the idle timeout")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestMentionFollowsAsker: the lines that need a human address the one
+// whose message the turn answers — the requester on the first turn, even
+// when someone else answers its prompt, and whoever followed up after
+// that — while the task's requester stays the one who started it.
+func TestMentionFollowsAsker(t *testing.T) {
+	ctx, c, st, tr := mentionHarness(t, 200*time.Millisecond)
 
 	th := transport.ThreadID("C-dev/1.0")
 	tr.sayAs(th, "u1", "run coder do the thing")
@@ -534,40 +559,81 @@ func TestMentionStaysWithRequester(t *testing.T) {
 		t.Errorf("done line addressed to %q after u2 allowed, want u1", o.Mention)
 	}
 
-	// u2 follows up after the idle timeout: the resumed turn still reports to u1.
+	// u2 follows up after the idle timeout: the resumed turn reports to u2.
 	id := firstTask(t, st)
-	deadline := time.Now().Add(3 * time.Second)
-	for ex.IsRunning(id) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitUnbound(t, c, th)
 	tr.sayAs(th, "u2", "again")
 	tr.waitFor(t, th, "echo:again")
-	if o := tr.waitForN(t, th, "✅ done", 2); o.Mention != "u1" {
-		t.Errorf("resumed done line addressed to %q after u2 followed up, want u1", o.Mention)
+	if o := tr.waitForN(t, th, "✅ done", 2); o.Mention != "u2" {
+		t.Errorf("resumed done line addressed to %q after u2 followed up, want u2", o.Mention)
 	}
-	if ts, err := st.GetTask(ctx, id); err != nil || ts.Requester != "u1" {
-		t.Errorf("requester = %q err=%v, want u1", ts.Requester, err)
+	if ts, err := st.GetTask(ctx, id); err != nil || ts.Requester != "u1" || ts.Asker != "u2" {
+		t.Errorf("requester, asker = %q, %q err=%v, want u1, u2", ts.Requester, ts.Asker, err)
 	}
 
 	// A new task on the same thread, started by u2, is u2's. `run` is
 	// refused while the thread is bound to the first task, so wait for
 	// exactly that to clear.
-	deadline = time.Now().Add(3 * time.Second)
-	for {
-		if _, busy := c.lookup(th); !busy {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("thread still bound to the first task after the idle timeout")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitUnbound(t, c, th)
 	tr.sayAs(th, "u2", "run coder other thing")
 	if o := tr.waitForN(t, th, "wants to run", 2); o.Mention != "u2" {
 		t.Errorf("u2's own task addressed to %q, want u2", o.Mention)
 	}
 	if ts, err := st.LatestTaskForThread(ctx, th); err != nil || ts.ID == id || ts.Requester != "u2" {
 		t.Errorf("u2's task = %+v err=%v, want a new task with requester u2", ts, err)
+	}
+}
+
+// TestMentionFollowsAskerWarm: a follow-up that reaches the agent process
+// still kept alive after its turn addresses its own author too, and the
+// turn after that goes back to whoever wrote it.
+func TestMentionFollowsAskerWarm(t *testing.T) {
+	ctx, c, st, tr := mentionHarness(t, time.Minute)
+
+	th := transport.ThreadID("C-dev/2.0")
+	tr.sayAs(th, "u1", "run coder do the thing")
+	p := tr.waitFor(t, th, "wants to run")
+	tr.decideAs(th, "u1", p.Prompt.ID, "allow")
+	if o := tr.waitFor(t, th, "✅ done"); o.Mention != "u1" {
+		t.Errorf("first done line addressed to %q, want u1", o.Mention)
+	}
+	id := firstTask(t, st)
+	if bound, ok := c.lookup(th); !ok || bound != id {
+		t.Fatalf("thread not bound to the warm task: %q %v", bound, ok)
+	}
+	tr.sayAs(th, "u2", "again")
+	tr.waitFor(t, th, "echo:again")
+	if o := tr.waitForN(t, th, "✅ done", 2); o.Mention != "u2" {
+		t.Errorf("warm follow-up done line addressed to %q, want u2", o.Mention)
+	}
+	tr.sayAs(th, "u1", "once more")
+	tr.waitFor(t, th, "echo:once more")
+	if o := tr.waitForN(t, th, "✅ done", 3); o.Mention != "u1" {
+		t.Errorf("u1's next done line addressed to %q, want u1", o.Mention)
+	}
+	if ts, err := st.GetTask(ctx, id); err != nil || ts.Requester != "u1" || ts.Asker != "u1" {
+		t.Errorf("requester, asker = %q, %q err=%v, want u1, u1", ts.Requester, ts.Asker, err)
+	}
+}
+
+// TestMentionMidTurnGoesToTheLatestWriter: a message written while a turn
+// is still going joins that turn (a driver steers it in), so the turn's
+// closing line addresses its writer — and a prompt answered by someone
+// else does not take the tag back.
+func TestMentionMidTurnGoesToTheLatestWriter(t *testing.T) {
+	_, _, _, tr := mentionHarness(t, time.Minute)
+
+	th := transport.ThreadID("C-dev/3.0")
+	tr.sayAs(th, "u1", "run coder do the thing")
+	p := tr.waitFor(t, th, "wants to run") // u1's turn is open, waiting on the prompt
+	tr.sayAs(th, "u2", "and also this")
+	tr.waitFor(t, th, "echo:and also this")
+	if o := tr.waitFor(t, th, "✅ done"); o.Mention != "u2" {
+		t.Errorf("closing line after u2 wrote mid-turn addressed %q, want u2", o.Mention)
+	}
+	tr.decideAs(th, "u1", p.Prompt.ID, "allow")
+	if o := tr.waitForN(t, th, "✅ done", 2); o.Mention != "u2" {
+		t.Errorf("closing line after u1 answered the prompt addressed %q, want u2", o.Mention)
 	}
 }
 

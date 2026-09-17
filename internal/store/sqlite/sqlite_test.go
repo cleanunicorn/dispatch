@@ -51,7 +51,7 @@ func TestStore(t *testing.T) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 
-	ts := store.TaskState{ID: "t1", Transport: "slack", Thread: "th1", Definition: def, Requester: "U42", Status: store.StatusRunning, LastSeq: seq2}
+	ts := store.TaskState{ID: "t1", Transport: "slack", Thread: "th1", Definition: def, Requester: "U42", Asker: "U7", Status: store.StatusRunning, LastSeq: seq2}
 	if err := s.PutTask(ctx, ts); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	back, err := s.GetTask(ctx, "t1")
-	if err != nil || back.Session != "sess" || back.Model != "claude-haiku-4-5" || back.ModelPin != "opus" || back.Status != store.StatusIdle || back.Definition.Name != "coder" || back.Transport != "slack" || back.Requester != "U42" {
+	if err != nil || back.Session != "sess" || back.Model != "claude-haiku-4-5" || back.ModelPin != "opus" || back.Status != store.StatusIdle || back.Definition.Name != "coder" || back.Transport != "slack" || back.Requester != "U42" || back.Asker != "U7" {
 		t.Fatalf("get task = %+v err=%v", back, err)
 	}
 	latest, err := s.LatestTaskForThread(ctx, "th1")
