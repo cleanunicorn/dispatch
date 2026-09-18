@@ -98,12 +98,14 @@ func TestAppServerRoundTrip(t *testing.T) {
 	f.wrote(t, `"method":"initialize"`)
 	f.say(`{"jsonrpc":"2.0","id":1,"result":{}}`)
 	f.wrote(t, `"method":"initialized"`)
+	f.wrote(t, `"method":"account/read"`)
+	f.say(`{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}}`)
 	start := f.wrote(t, `"method":"thread/start"`)
 	if !strings.Contains(start, `"approvalPolicy":"untrusted"`) || !strings.Contains(start, `"sandbox":"read-only"`) {
 		t.Fatalf("thread start = %s", start)
 	}
-	f.say(`{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1","model":"gpt-test"}}}`)
-	if e := next(t, r); e.Type != agent.EventInit || e.Session != "thr-1" || e.Model != "gpt-test" {
+	f.say(`{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"thr-1","model":"gpt-test"}}}`)
+	if e := next(t, r); e.Type != agent.EventInit || e.Session != "thr-1" || e.Model != "gpt-test" || e.Billing != agent.BillingAPIKey {
 		t.Fatalf("init = %+v", e)
 	}
 	f.wrote(t, `"method":"turn/start"`)
@@ -130,8 +132,14 @@ func TestAppServerRoundTrip(t *testing.T) {
 		t.Fatalf("tool result = %+v", e)
 	}
 	f.say(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}`)
-	if e := next(t, r); e.Type != agent.EventResult {
+	if e := next(t, r); e.Type != agent.EventResult || e.Billing != agent.BillingAPIKey {
 		t.Fatalf("result = %+v", e)
+	}
+	// A metered session has no plan to report on.
+	select {
+	case e := <-r.Events():
+		t.Fatalf("API-key session sent %+v after its result", e)
+	case <-time.After(200 * time.Millisecond):
 	}
 	f.exit()
 }
@@ -185,6 +193,20 @@ func TestLiveAppServer(t *testing.T) {
 				if text != "CODEX_DRIVER_OK" {
 					t.Fatalf("reply = %q", text)
 				}
+				if ev.Billing != agent.BillingSubscription {
+					t.Logf("billing = %q: no plan usage to check", ev.Billing)
+					return
+				}
+				// A ChatGPT login reports the plan's windows after the turn.
+				select {
+				case u := <-r.Events():
+					if u.Type != agent.EventUsage || u.Usage == nil || len(u.Usage.Windows) == 0 {
+						t.Fatalf("after a subscription result = %+v", u)
+					}
+					t.Logf("usage: plan=%q windows=%+v", u.Usage.Plan, u.Usage.Windows)
+				case <-time.After(30 * time.Second):
+					t.Fatal("no usage after a subscription result")
+				}
 				return
 			}
 		case <-deadline:
@@ -221,6 +243,8 @@ func TestResumeCarriesThreadOptions(t *testing.T) {
 	}
 	f.wrote(t, `"method":"initialize"`)
 	f.say(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+	f.wrote(t, `"method":"account/read"`)
+	f.say(`{"jsonrpc":"2.0","id":2,"result":{"account":null,"requiresOpenaiAuth":true}}`)
 	got := f.wrote(t, `"method":"thread/resume"`)
 	for _, want := range []string{`"threadId":"thr-old"`, `"approvalPolicy":"untrusted"`, `"sandbox":"read-only"`, `"model":"gpt-test"`, "be brief"} {
 		if !strings.Contains(got, want) {
@@ -303,14 +327,22 @@ func TestOtherThreadNotificationsIgnored(t *testing.T) {
 // ready drives the handshake up to a started turn and returns the run.
 func ready(t *testing.T, f *fakeProc) agent.Run {
 	t.Helper()
+	return readyAs(t, f, `{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}`)
+}
+
+// readyAs is ready with the answer account/read gets.
+func readyAs(t *testing.T, f *fakeProc, account string) agent.Run {
+	t.Helper()
 	r, err := (&Agent{Binary: "codex"}).Start(context.Background(), fakeEnv{f}, agent.Definition{Kind: agent.KindCodex, PermissionMode: agent.PermissionManual}, "hello")
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.wrote(t, `"method":"initialize"`)
 	f.say(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+	f.wrote(t, `"method":"account/read"`)
+	f.say(`{"jsonrpc":"2.0","id":2,"result":` + account + `}`)
 	f.wrote(t, `"method":"thread/start"`)
-	f.say(`{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}`)
+	f.say(`{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"thr-1"}}}`)
 	if e := next(t, r); e.Type != agent.EventInit {
 		t.Fatalf("init = %+v", e)
 	}
@@ -323,6 +355,81 @@ func ready(t *testing.T, f *fakeProc) agent.Run {
 		t.Fatalf("turn did not start: %+v", e)
 	}
 	return r
+}
+
+// A ChatGPT login is a plan, not a bill: the result carries no dollar figure
+// to show, and the plan's windows follow it as an EventUsage.
+func TestSubscriptionReportsPlanUsage(t *testing.T) {
+	f := newFakeProc()
+	r := readyAs(t, f, `{"account":{"type":"chatgpt","email":"x@y","planType":"prolite"},"requiresOpenaiAuth":true}`)
+	f.say(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}`)
+	if e := next(t, r); e.Type != agent.EventResult || e.Billing != agent.BillingSubscription {
+		t.Fatalf("result = %+v", e)
+	}
+	req := f.wrote(t, `"method":"account/rateLimits/read"`)
+	// Captured from Codex CLI 0.154.0 on a prolite plan, plus a model bucket.
+	f.say(`{"id":` + itoa(requestID(t, req)) + `,"result":{"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":47,"windowDurationMins":10080,"resetsAt":1790060019},"secondary":null,"planType":"prolite"},"rateLimitsByLimitId":{"codex":{"limitId":"codex","limitName":null,"primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1790000000},"secondary":{"usedPercent":47,"windowDurationMins":10080,"resetsAt":1790060019},"planType":"prolite"},"codex_spark":{"limitId":"codex_spark","limitName":"GPT-5.3-Codex-Spark","primary":{"usedPercent":3,"windowDurationMins":10080,"resetsAt":null},"secondary":null}}}}`)
+	e := next(t, r)
+	if e.Type != agent.EventUsage || e.Usage == nil || e.Billing != agent.BillingSubscription {
+		t.Fatalf("usage = %+v", e)
+	}
+	want := []agent.UsageWindow{
+		{Name: "5h", Used: 12, ResetsAt: time.Unix(1790000000, 0)},
+		{Name: "7d", Used: 47, ResetsAt: time.Unix(1790060019, 0)},
+		{Name: "GPT-5.3-Codex-Spark", Used: 3},
+	}
+	if e.Usage.Plan != "prolite" || len(e.Usage.Windows) != len(want) {
+		t.Fatalf("usage = %+v", e.Usage)
+	}
+	for i, w := range want {
+		if g := e.Usage.Windows[i]; g.Name != w.Name || g.Used != w.Used || !g.ResetsAt.Equal(w.ResetsAt) {
+			t.Errorf("window %d = %+v, want %+v", i, g, w)
+		}
+	}
+	f.exit()
+}
+
+// A failed lookup costs the meter, never the session: no error event, and
+// the next message still reaches the agent.
+func TestUsageLookupFailureIsQuiet(t *testing.T) {
+	f := newFakeProc()
+	r := readyAs(t, f, `{"account":{"type":"chatgpt","email":"x@y","planType":"plus"},"requiresOpenaiAuth":true}`)
+	f.say(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}`)
+	if e := next(t, r); e.Type != agent.EventResult {
+		t.Fatalf("result = %+v", e)
+	}
+	req := f.wrote(t, `"method":"account/rateLimits/read"`)
+	f.say(`{"id":` + itoa(requestID(t, req)) + `,"error":{"code":-32603,"message":"backend unavailable"}}`)
+	select {
+	case e := <-r.Events():
+		t.Fatalf("failed usage lookup sent %+v", e)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := r.Send(context.Background(), "next"); err != nil {
+		t.Fatal(err)
+	}
+	f.wrote(t, `"method":"turn/start"`)
+	f.exit()
+}
+
+// An older CLI without account/read still starts the thread; billing is
+// then unknown, as it was before the driver asked.
+func TestAccountReadUnsupported(t *testing.T) {
+	f := newFakeProc()
+	r, err := (&Agent{Binary: "codex"}).Start(context.Background(), fakeEnv{f}, agent.Definition{Kind: agent.KindCodex}, "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.wrote(t, `"method":"initialize"`)
+	f.say(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+	f.wrote(t, `"method":"account/read"`)
+	f.say(`{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"method not found"}}`)
+	f.wrote(t, `"method":"thread/start"`)
+	f.say(`{"jsonrpc":"2.0","id":3,"result":{"thread":{"id":"thr-1"}}}`)
+	if e := next(t, r); e.Type != agent.EventInit || e.Billing != agent.BillingUnknown {
+		t.Fatalf("init = %+v", e)
+	}
+	f.exit()
 }
 
 func requestID(t *testing.T, line string) int64 {
