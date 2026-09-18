@@ -393,7 +393,7 @@ func TestSubscriptionReportsPlanUsage(t *testing.T) {
 // the next message still reaches the agent.
 func TestUsageLookupFailureIsQuiet(t *testing.T) {
 	f := newFakeProc()
-	r := readyAs(t, f, `{"account":{"type":"chatgpt","email":"x@y","planType":"plus"},"requiresOpenaiAuth":true}`)
+	r := readyAs(t, f, chatgptPlus)
 	f.say(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}`)
 	if e := next(t, r); e.Type != agent.EventResult {
 		t.Fatalf("result = %+v", e)
@@ -410,6 +410,119 @@ func TestUsageLookupFailureIsQuiet(t *testing.T) {
 	}
 	f.wrote(t, `"method":"turn/start"`)
 	f.exit()
+}
+
+const chatgptPlus = `{"account":{"type":"chatgpt","email":"x@y","planType":"plus"},"requiresOpenaiAuth":true}`
+
+// A turn that ended badly on a subscription still spent the plan: the error
+// carries the billing and the lookup still follows it.
+func TestFailedTurnStillReportsUsage(t *testing.T) {
+	f := newFakeProc()
+	r := readyAs(t, f, chatgptPlus)
+	f.say(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"failed","error":{"message":"stream disconnected"}}}}`)
+	if e := next(t, r); e.Type != agent.EventError || e.Billing != agent.BillingSubscription {
+		t.Fatalf("error = %+v", e)
+	}
+	f.wrote(t, `"method":"account/rateLimits/read"`)
+	f.exit()
+}
+
+// A sub-agent's turn ending is not this run's: on a subscription it must not
+// set off a lookup either.
+func TestOtherThreadTurnAsksNoUsage(t *testing.T) {
+	f := newFakeProc()
+	r := readyAs(t, f, chatgptPlus)
+	f.say(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-other","turn":{"id":"t-x","status":"completed"}}}`)
+	f.say(`{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"m-1","type":"agentMessage","text":"mine"}}}`)
+	if e := next(t, r); e.Type != agent.EventText || e.Text != "mine" {
+		t.Fatalf("event = %+v", e)
+	}
+	deadline := time.After(200 * time.Millisecond)
+	for {
+		select {
+		case line := <-f.got:
+			if strings.Contains(line, "account/rateLimits/read") {
+				t.Fatalf("sub-agent turn asked for usage: %s", line)
+			}
+		case <-deadline:
+			f.exit()
+			return
+		}
+	}
+}
+
+func TestParseRateLimits(t *testing.T) {
+	for _, tt := range []struct {
+		name, raw, plan string
+		want            []string // window names in order
+		wantPlan        string
+	}{
+		{
+			// An older CLI sends the single-bucket view only.
+			name:     "top-level only",
+			raw:      `{"rateLimits":{"limitId":"codex","primary":{"usedPercent":10,"windowDurationMins":300},"secondary":{"usedPercent":20,"windowDurationMins":10080},"planType":"pro"}}`,
+			want:     []string{"5h", "7d"},
+			wantPlan: "pro",
+		},
+		{
+			name: "weekly sent as primary sorts after the short window",
+			raw:  `{"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":40,"windowDurationMins":10080},"secondary":{"usedPercent":5,"windowDurationMins":300}}}}`,
+			plan: "plus", want: []string{"5h", "7d"}, wantPlan: "plus",
+		},
+		{
+			name: "no span falls back to the bucket's name",
+			raw:  `{"rateLimits":{"limitId":"codex","primary":{"usedPercent":10}}}`,
+			want: []string{"codex"},
+		},
+		{
+			name: "model bucket with two windows names both",
+			raw:  `{"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":1,"windowDurationMins":10080}},"spark":{"limitId":"spark","limitName":"Spark","primary":{"usedPercent":2,"windowDurationMins":90},"secondary":{"usedPercent":3,"windowDurationMins":10080}}}}`,
+			want: []string{"7d", "Spark 90m", "Spark 7d"},
+		},
+		{name: "no windows", raw: `{"rateLimits":{"limitId":"codex"}}`},
+		{name: "not json", raw: `nope`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			u := parseRateLimits(json.RawMessage(tt.raw), tt.plan)
+			if tt.want == nil {
+				if u != nil {
+					t.Fatalf("usage = %+v, want nil", u)
+				}
+				return
+			}
+			if u == nil {
+				t.Fatal("usage = nil")
+			}
+			var got []string
+			for _, w := range u.Windows {
+				got = append(got, w.Name)
+			}
+			if strings.Join(got, ",") != strings.Join(tt.want, ",") || u.Plan != tt.wantPlan {
+				t.Fatalf("windows = %v plan = %q, want %v %q", got, u.Plan, tt.want, tt.wantPlan)
+			}
+		})
+	}
+}
+
+func TestWindowName(t *testing.T) {
+	for _, tt := range []struct {
+		label string
+		mins  int64
+		both  bool
+		want  string
+	}{
+		{"", 300, false, "5h"},
+		{"", 10080, false, "7d"},
+		{"", 90, false, "90m"},
+		{"", 0, false, ""},
+		{"Spark", 10080, false, "Spark"},
+		{"Spark", 300, true, "Spark 5h"},
+		{"Spark", 0, true, "Spark"},
+	} {
+		if got := windowName(tt.label, tt.mins, tt.both); got != tt.want {
+			t.Errorf("windowName(%q, %d, %v) = %q, want %q", tt.label, tt.mins, tt.both, got, tt.want)
+		}
+	}
 }
 
 // An older CLI without account/read still starts the thread; billing is

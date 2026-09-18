@@ -18,17 +18,21 @@
 //   - Assistant text arrives twice, once as deltas and once whole. Only the
 //     whole message is emitted; a surface that posted every delta would post a
 //     message and write a log record per word.
-//   - Nothing on a turn says how it is paid for, and Codex prices nothing, so
-//     a result carries no cost. The handshake asks `account/read` before the
-//     thread starts: a ChatGPT login is a subscription and an API key is
-//     metered (agent.Billing, stamped on init and every result). On a
-//     subscription each ended turn is followed by `account/rateLimits/read`,
-//     reported as agent.EventUsage the way the claude driver reports
-//     get_usage — the plan's windows, not a dollar figure nobody is charged.
+//
+// And one thing the protocol leaves out and the driver has to ask for: nothing
+// on a turn says how it is paid for, and Codex prices nothing, so a result
+// carries no cost. The handshake asks `account/read` before the thread starts
+// — a ChatGPT login is a subscription and an API key is metered (agent.Billing,
+// stamped on init and every result). On a subscription each ended turn is
+// followed by `account/rateLimits/read`, reported as agent.EventUsage the way
+// the claude driver reports get_usage: the plan's windows, not a dollar figure
+// nobody is charged. Neither lookup can fail the session; an answer that never
+// comes costs the meter.
 package codex
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -109,10 +113,10 @@ type run struct {
 	stderr                       strings.Builder
 	loginHint                    string
 	done                         chan struct{}
-	ended                        bool          // loop goroutine only: this turn already reported an ending
-	billing                      agent.Billing // loop goroutine only: from account/read, stamped on init and results
-	plan                         string        // loop goroutine only: the ChatGPT plan account/read named
-	usageReqs                    map[int64]bool
+	ended                        bool           // loop goroutine only: this turn already reported an ending
+	billing                      agent.Billing  // loop goroutine only: from account/read, stamped on init and results
+	plan                         string         // loop goroutine only: the ChatGPT plan account/read named
+	usageReqs                    map[int64]bool // loop goroutine only: ids of account/rateLimits/read requests in flight
 }
 
 func (r *run) Events() <-chan agent.Event { return r.events }
@@ -272,9 +276,7 @@ func (r *run) loop(def agent.Definition) {
 			// Asked after the result went out, so the closing line never
 			// waits for the lookup; the answer becomes an EventUsage.
 			id := r.id()
-			r.mu.Lock()
 			r.usageReqs[id] = true
-			r.mu.Unlock()
 			_ = r.request(id, "account/rateLimits/read", nil)
 		}
 	}
@@ -287,8 +289,10 @@ func (r *run) loop(def agent.Definition) {
 	}
 }
 
-// response handles a successful answer to a request dispatch sent: the two
-// setup requests drive the handshake, anything else only settles bookkeeping.
+// response handles a successful answer to a request dispatch sent: the three
+// setup requests drive the handshake (initialize, account/read, then the
+// thread), a rate-limit answer becomes an EventUsage, and anything else only
+// settles bookkeeping.
 func (r *run) response(id int64, m message, raw []byte, def agent.Definition) {
 	switch id {
 	case initRequest:
@@ -322,9 +326,9 @@ func (r *run) response(id int64, m message, raw []byte, def agent.Definition) {
 	default:
 		r.mu.Lock()
 		delete(r.steers, id)
+		r.mu.Unlock()
 		usage := r.usageReqs[id]
 		delete(r.usageReqs, id)
-		r.mu.Unlock()
 		if usage {
 			if u := parseRateLimits(m.Result, r.plan); u != nil {
 				r.events <- agent.Event{Type: agent.EventUsage, At: time.Now(), Usage: u, Billing: r.billing, Raw: raw}
@@ -388,9 +392,10 @@ type rateBucket struct {
 }
 
 // parseRateLimits reads an account/rateLimits/read answer into agent.Usage:
-// the `codex` bucket's windows first (the short one, then the weekly one),
-// then any other bucket — a model with a quota of its own — under its name.
-// nil when there is no window to show.
+// the `codex` bucket's windows first, then any other bucket — a model with a
+// quota of its own — under its name. Within a bucket the shorter window comes
+// first whichever slot Codex sent it in: a plan with only a weekly window
+// reports it as primary. nil when there is no window to show.
 func parseRateLimits(raw json.RawMessage, plan string) *agent.Usage {
 	var x struct {
 		RateLimits *rateBucket            `json:"rateLimits"`
@@ -422,18 +427,27 @@ func parseRateLimits(raw json.RawMessage, plan string) *agent.Usage {
 		if u.Plan == "" {
 			u.Plan = planName(b.PlanType)
 		}
+		name := b.LimitName
+		if name == "" {
+			name = b.LimitID
+		}
 		label := ""
 		if i > 0 {
-			label = b.LimitName
-			if label == "" {
-				label = b.LimitID
+			label = name
+		}
+		ws := make([]*rateWindow, 0, 2)
+		for _, w := range []*rateWindow{b.Primary, b.Secondary} {
+			if w != nil {
+				ws = append(ws, w)
 			}
 		}
-		for _, w := range []*rateWindow{b.Primary, b.Secondary} {
-			if w == nil {
-				continue
+		sort.SliceStable(ws, func(i, j int) bool { return shorter(ws[i].WindowDurationMins, ws[j].WindowDurationMins) })
+		for _, w := range ws {
+			uw := agent.UsageWindow{Name: windowName(label, w.WindowDurationMins, len(ws) > 1), Used: w.UsedPercent}
+			if uw.Name == "" {
+				// The plan's own window with no span to name it by.
+				uw.Name = cmp.Or(name, "codex")
 			}
-			uw := agent.UsageWindow{Name: windowName(label, w.WindowDurationMins, b.Primary != nil && b.Secondary != nil), Used: w.UsedPercent}
 			if w.ResetsAt > 0 {
 				uw.ResetsAt = time.Unix(w.ResetsAt, 0)
 			}
@@ -444,6 +458,14 @@ func parseRateLimits(raw json.RawMessage, plan string) *agent.Usage {
 		return nil
 	}
 	return u
+}
+
+// shorter orders windows by span; one with no span sorts last.
+func shorter(a, b int64) bool {
+	if a <= 0 || b <= 0 {
+		return a > 0 && b <= 0
+	}
+	return a < b
 }
 
 // windowName is "5h" or "7d" for the plan's own windows, and a model's
@@ -469,19 +491,22 @@ func windowName(label string, mins int64, both bool) string {
 }
 
 // responseError handles a JSON-RPC error answering one of dispatch's own
-// requests. Only the two setup requests are fatal — without a thread there is
-// no turn that could ever end, so the process is torn down rather than left
-// waiting. A steer that lost its race with the turn's end is re-sent as a
-// turn of its own; every other error is reported and the session kept, which
-// is what makes a warm session survive one bad request.
+// requests. Only initialize and the thread request are fatal — without a
+// thread there is no turn that could ever end, so the process is torn down
+// rather than left waiting. account/read is the setup request that is not:
+// an unknown billing costs the usage meter, so the thread starts anyway, and
+// a failed rate-limit lookup after a turn is dropped the same way. A steer
+// that lost its race with the turn's end is re-sent as a turn of its own;
+// every other error is reported and the session kept, which is what makes a
+// warm session survive one bad request.
 func (r *run) responseError(id int64, e *rpcError, raw []byte, def agent.Definition) {
 	r.mu.Lock()
 	text, steered := r.steers[id]
 	delete(r.steers, id)
-	usage := r.usageReqs[id]
-	delete(r.usageReqs, id)
 	thread := r.thread
 	r.mu.Unlock()
+	usage := r.usageReqs[id]
+	delete(r.usageReqs, id)
 	switch {
 	case id == accountRequest:
 		// Not knowing how the session is paid for costs the usage meter, not
