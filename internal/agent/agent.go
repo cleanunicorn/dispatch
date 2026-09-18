@@ -197,7 +197,7 @@ const (
 // session never sends one, and neither does an agent that could not say
 // (an older CLI, a failed lookup) — then Cost is all there is.
 type Usage struct {
-	Plan    string        // "pro", "max", "team", "enterprise"; "" when unknown
+	Plan    string        // as the vendor names it: claude "pro", "max", "team", "enterprise"; codex "plus", "pro", "prolite", "business", …; "" when unknown
 	Windows []UsageWindow // display order: the short window, the weekly one, then per-model weekly windows
 }
 
