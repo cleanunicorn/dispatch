@@ -30,7 +30,8 @@ STATE      ?= /var/lib/dispatch/deployed.sha
 .DEFAULT_GOAL := help
 .PHONY: help build run run-terminal run-web ui ui-dev setup doctor test test-race test-live e2e restart-drill auto-resume-drill lint fmt tidy clean \
         install uninstall service-install service-uninstall service-restart service-status service-logs \
-        update-install update-uninstall update-now update-status update-logs deploy-env
+        update-install update-uninstall update-now update-status update-logs deploy-env \
+        docker-build docker-run docker-stop docker-logs
 
 ## ---- build -----------------------------------------------------------------
 
@@ -180,6 +181,35 @@ update-status: ## Show when the update timer last ran and next fires
 
 update-logs: ## Follow updater logs
 	journalctl -u dispatch-update.service -f
+
+## ---- run it in docker -------------------------------------------------------
+
+DOCKER_IMAGE ?= dispatch:local
+# The container user reads the docker socket through this group.
+DOCKER_GID ?= $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo 999)
+
+docker-build: ## Build the dispatch container image (deploy/docker; context is the repo root)
+	docker build -f deploy/docker/Dockerfile --build-arg GIT_SHA=$$(git rev-parse HEAD) -t $(DOCKER_IMAGE) .
+
+docker-run: docker-build ## Run it: config + logins mounted from $HOME, docker socket lent in
+	@test -f "$(CONFIG)" || { echo "no config at $(CONFIG) — run make setup first"; exit 1; }
+	@docker rm -f dispatch >/dev/null 2>&1 || true
+	docker run -d --name dispatch --init --restart unless-stopped --stop-timeout 150 \
+		--group-add $(DOCKER_GID) \
+		-v dispatch-data:/opt/dispatch \
+		-v $(dir $(CONFIG)):/home/dispatch/.config/dispatch \
+		-v $(HOME)/.claude:/home/dispatch/.claude \
+		-v $(HOME)/.config/gh:/home/dispatch/.config/gh \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-p 127.0.0.1:8788:8788 \
+		$(DOCKER_IMAGE)
+	@docker logs -f dispatch
+
+docker-stop: ## Stop and remove the container (SIGTERM: drain, persist, exit 0)
+	docker stop -t 150 dispatch && docker rm dispatch
+
+docker-logs: ## Follow the container's logs (dispatch and the updater both log here)
+	docker logs -f dispatch
 
 ## ---- help -------------------------------------------------------------------
 

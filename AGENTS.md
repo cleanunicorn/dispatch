@@ -279,7 +279,9 @@ internal/decider/        static, claude, openai — policy verdicts
 internal/work/           mines "what is this thread working on" from the log
 internal/gh/             lends the host's GitHub login + git identity
 internal/config/         config.toml load/validate/textual write-back
-deploy/                  systemd units, config.example.toml, Slack manifest
+deploy/                  systemd units, config.example.toml, Slack manifest,
+                         Dockerfile + entrypoint + updater for a containerized
+                         instance (deploy/docker)
 scripts/                 e2e.py, restart-drill.py, auto-resume-drill.py
 docs/                    slack.md, web.md, terminal.md
 ```

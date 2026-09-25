@@ -280,6 +280,78 @@ A private repo needs credentials root can use non-interactively — a deploy key
 plus `REPO=git@github.com:you/dispatch.git` and a `/root/.ssh/config` entry, or a
 token in the URL.
 
+## 8. Or run it in Docker
+
+Same thing as §6 and §7 — dispatch as a service that keeps itself up to date —
+inside one container. `deploy/docker/Dockerfile` builds an image that carries
+the dispatch binary from the checkout it was built from, the Go toolchain, the
+claude CLI (installed as the container user, so its own auto-updater works),
+the gh CLI and the docker CLI; `deploy/docker/entrypoint.sh` runs dispatch,
+restarts it on crash, and polls `origin/<branch>` every
+`DISPATCH_UPDATE_INTERVAL` seconds (default 300, first tick after 120) with
+`deploy/docker/dispatch-update.sh` — the `dispatch-update.timer` analog, built
+in.
+
+```sh
+make docker-run        # builds the image, runs the container with the mounts below
+make docker-logs       # dispatch and the updater both log here
+make docker-stop       # SIGTERM: drain, persist, exit 0
+```
+
+or, from `deploy/docker/`, `docker compose up -d --build` — `compose.yaml` is
+the same set of mounts as the Makefile target, with comments.
+
+A container borrows the host's logins the same way dispatch lends them to agent
+environments, by *mounting* them rather than copying:
+
+| mount | what it carries |
+|---|---|
+| `dispatch-data` → `/opt/dispatch` | the deploy checkout, the live binary, the updater's state |
+| `~/.config/dispatch` → `/home/dispatch/.config/dispatch` | the config, the SQLite event log and the per-task workdirs — point `db` and `workdir_root` in the config at paths under here, and `[web] listen = "0.0.0.0:8788"` so the port mapping reaches the browser UI |
+| `~/.claude` → `/home/dispatch/.claude` | the host's Claude Code login, used by dispatch itself and lent into agent environments |
+| `~/.config/gh` → `/home/dispatch/.config/gh` | the host's GitHub login, same story |
+| `/var/run/docker.sock` | only if agent definitions use docker environments; `group_add` the socket's gid (`stat -c %g /var/run/docker.sock`) |
+
+Because `~/.claude` and `~/.config/gh` *are* the host's login files, the
+borrowing rules work unchanged: a docker-environment agent container gets the
+same credentials it would get from a host-installed dispatch. The agent
+container's uid is the dispatch user's uid inside the container (1000), so
+files it writes into mounted workdirs stay owned by whoever owns that path on
+the host — if your user's uid is not 1000, either chown the config directory to
+the container's uid or run the container with `user: "<your uid>:<your gid>"`.
+
+The updater runs as a loop inside the container and follows the same contract
+as the host one: clone once into `/opt/dispatch/src`, hard-reset to
+`origin/<branch>` every tick, build into a scratch directory, smoke-test
+(`dispatch -h`), install with an atomic rename, SIGTERM dispatch and wait for
+the drain, then wait for the entrypoint to start the new process and prove it
+stays up (10s) before writing the deployed sha. A binary that will not stay up
+is rolled back from `$BIN.prev` and its sha recorded as `deployed.sha.failed`,
+skipped until the branch moves. It also deploys the glue: a changed updater is
+re-executed on the spot, a changed entrypoint is installed and takes effect on
+the next container start (`DISPATCH_UPDATE_SYNC_GLUE=0` turns glue off).
+
+| failure | what happens |
+|---|---|
+| `main` does not compile | old binary keeps running, exit 1 in `docker logs`, retried every tick |
+| new binary fails `dispatch -h` | same — it never reaches `/opt/dispatch/bin/dispatch` |
+| new binary installs but will not stay up | the previous binary is restored, the entrypoint restarts dispatch on it, the sha is skipped until the branch moves |
+| the old process ignores SIGTERM past `DISPATCH_UPDATE_DRAIN_WAIT` (300s) | nothing is committed, the old binary keeps running, the next tick retries |
+
+Run a tick by hand (or re-deploy a skipped sha): `docker exec dispatch
+/usr/local/lib/dispatch/dispatch-update.sh`, with `-e DISPATCH_UPDATE_FORCE=1`
+to retry.
+To run dispatch as-is while the branch moves — a pinned version, maintenance —
+`docker compose down && DISPATCH_UPDATE_DISABLE=1 docker compose up -d`.
+
+A private repo needs credentials the container user can use non-interactively,
+the same two ways the host updater does: a token in `DISPATCH_REPO`'s URL.
+
+`docker compose stop` (or `docker stop -t 150`) is the safe restart: SIGTERM
+notifies live threads, in-flight tool calls get `drain_timeout` to finish, the
+container exits 0, and interrupted tasks resume themselves on the next start —
+the same contract the systemd unit carries.
+
 ## Files from the agent
 
 When the agent mentions a file path in its reply (`/tmp/settings-top.png`,

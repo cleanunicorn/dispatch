@@ -1,0 +1,9 @@
+# Build context for deploy/docker/Dockerfile (docker build is run from the repo
+# root). Only go.mod, go.sum, cmd/ and internal/ are copied into the build
+# stage; everything below is kept out of the context.
+.git
+.claude
+bin
+*.db
+package-lock.json
+internal/transport/web/ui/node_modules
