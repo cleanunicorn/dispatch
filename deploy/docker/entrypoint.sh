@@ -40,6 +40,9 @@ FIRST=${DISPATCH_UPDATE_FIRST:-120}
 # 1 skips the update service entirely (0 leaves it on): for maintenance, or a
 # pinned version you want to keep running while the branch moves.
 DISABLE=${DISPATCH_UPDATE_DISABLE:-0}
+# A tick is a git fetch against GitHub; a typo (0) must not turn the loop
+# into a fetch hammer.
+[ "$INTERVAL" -ge 60 ] 2>/dev/null || INTERVAL=60
 
 mkdir -p "$SRC" "$(dirname "$BIN")" "$(dirname "$STATE")" "$(dirname "$PIDFILE")"
 
@@ -91,8 +94,10 @@ STOPPING=0
 child=0
 term() {
 	STOPPING=1
-	kill "$UPDATER_PID" 2>/dev/null || true
-	kill "$child" 2>/dev/null || true
+	[ -n "$UPDATER_PID" ] && kill "$UPDATER_PID" 2>/dev/null || true
+	# A signal can arrive before start_dispatch has set child; kill 0
+	# would signal the whole process group, not just dispatch.
+	[ "$child" -gt 0 ] && kill "$child" 2>/dev/null || true
 }
 trap term TERM INT
 trap 'rm -f "$PIDFILE"' EXIT
@@ -101,6 +106,12 @@ start_dispatch() {
 	"$BIN" run -config "$CONFIG" "$@" &
 	child=$!
 	printf '%s\n' "$child" > "$PIDFILE"
+	# A signal that arrived while no child was running set STOPPING but had
+	# nothing to kill; stop the child we just started rather than wait for
+	# it to exit on its own.
+	if [ "$STOPPING" = 1 ]; then
+		kill "$child" 2>/dev/null || true
+	fi
 }
 
 log "starting dispatch from $(cat "$STATE" 2>/dev/null || echo unknown)"
@@ -110,11 +121,14 @@ while :; do
 	rc=0
 	wait "$child" || rc=$?
 	if [ "$STOPPING" = 1 ]; then
-		# The trap interrupted the wait; the process is still draining.
-		# Reap its real exit status — the interrupted wait reported only
-		# the signal that interrupted it.
-		rc=0
-		wait "$child" 2>/dev/null || rc=$?
+		# An interrupted wait reports only the signal that interrupted it
+		# (>128); the process is still draining, so reap its real exit
+		# status. If the child had already exited, the first wait reaped
+		# it and rc is already the real one.
+		if [ "$rc" -gt 128 ]; then
+			rc=0
+			wait "$child" 2>/dev/null || rc=$?
+		fi
 		log "dispatch stopped (rc=$rc) — exiting"
 		exit 0
 	fi

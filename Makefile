@@ -191,9 +191,10 @@ DOCKER_GID ?= $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo 999)
 docker-build: ## Build the dispatch container image (deploy/docker; context is the repo root)
 	docker build -f deploy/docker/Dockerfile --build-arg GIT_SHA=$$(git rev-parse HEAD) -t $(DOCKER_IMAGE) .
 
-docker-run: docker-build ## Run it: config + logins mounted from $HOME, docker socket lent in
+docker-run: docker-build ## Run it (replaces an existing container gracefully): config + logins from $HOME, docker socket lent in
 	@test -f "$(CONFIG)" || { echo "no config at $(CONFIG) — run make setup first"; exit 1; }
-	@docker rm -f dispatch >/dev/null 2>&1 || true
+	@docker stop -t 150 dispatch >/dev/null 2>&1 || true
+	@docker rm dispatch >/dev/null 2>&1 || true
 	docker run -d --name dispatch --init --restart unless-stopped --stop-timeout 150 \
 		--group-add $(DOCKER_GID) \
 		-v dispatch-data:/opt/dispatch \

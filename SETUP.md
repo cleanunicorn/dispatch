@@ -317,8 +317,12 @@ borrowing rules work unchanged: a docker-environment agent container gets the
 same credentials it would get from a host-installed dispatch. The agent
 container's uid is the dispatch user's uid inside the container (1000), so
 files it writes into mounted workdirs stay owned by whoever owns that path on
-the host — if your user's uid is not 1000, either chown the config directory to
-the container's uid or run the container with `user: "<your uid>:<your gid>"`.
+the host. The container itself runs as uid 1000, so what you mount in must be
+readable — and where dispatch writes (the config dir carries the SQLite log),
+writable — by uid 1000: if your user's uid is not 1000, `chown -R 1000:1000`
+the mounted config directory. Do not run the container with `user:` instead:
+`$HOME` (/home/dispatch) is baked into the image for uid 1000 and would not be
+writable.
 
 The updater runs as a loop inside the container and follows the same contract
 as the host one: clone once into `/opt/dispatch/src`, hard-reset to
@@ -342,7 +346,9 @@ Run a tick by hand (or re-deploy a skipped sha): `docker exec dispatch
 /usr/local/lib/dispatch/dispatch-update.sh`, with `-e DISPATCH_UPDATE_FORCE=1`
 to retry.
 To run dispatch as-is while the branch moves — a pinned version, maintenance —
-`docker compose down && DISPATCH_UPDATE_DISABLE=1 docker compose up -d`.
+uncomment `DISPATCH_UPDATE_DISABLE: "1"` in compose's `environment:` block and
+`docker compose up -d` (or `docker run -e DISPATCH_UPDATE_DISABLE=1`). A
+shell-environment variable does not reach the container through compose.
 
 A private repo needs credentials the container user can use non-interactively,
 the same two ways the host updater does: a token in `DISPATCH_REPO`'s URL.
