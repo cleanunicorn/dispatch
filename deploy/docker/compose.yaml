@@ -1,0 +1,41 @@
+# dispatch in Docker. From deploy/docker/: docker compose up -d --build
+#
+# What this mounts and why — SETUP.md, "Running it in Docker":
+#   dispatch-data  /opt/dispatch — the deploy checkout, the live binary and the
+#                  updater's state; survives container recreation
+#   ~/.config/dispatch  the config + the SQLite event log + per-task workdirs
+#   ~/.claude           the host's Claude Code login, lent to dispatch itself
+#                       and through it into agent environments
+#   ~/.config/gh        the host's GitHub login, same story
+#   /var/run/docker.sock  only needed for agent definitions with docker
+#                       environments. If the socket's group id is not 999,
+#                       set DOCKER_GID: stat -c %g /var/run/docker.sock
+#
+# The container's [web] transport must listen on 0.0.0.0:8788 for the port
+# mapping to reach it; keep 127.0.0.1 in front (SSH tunnel or reverse proxy).
+services:
+  dispatch:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+    image: dispatch:local
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 150s    # drain_timeout (2m) + margin, like the systemd unit
+    group_add:
+      - "${DOCKER_GID:-999}"   # the host docker socket's group id
+    environment:
+      DISPATCH_BRANCH: main
+      DISPATCH_UPDATE_INTERVAL: "300"
+      # DISPATCH_UPDATE_DISABLE: "1"   # run dispatch as-is while the branch moves
+    volumes:
+      - dispatch-data:/opt/dispatch
+      - ${HOME}/.config/dispatch:/home/dispatch/.config/dispatch
+      - ${HOME}/.claude:/home/dispatch/.claude
+      - ${HOME}/.config/gh:/home/dispatch/.config/gh
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:8788:8788"
+
+volumes:
+  dispatch-data:
